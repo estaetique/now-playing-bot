@@ -5,12 +5,16 @@
  * - Rotates album art cover each refresh
  * - Opens a web port for Render health checks
  * - Adds clickable Spotify links + progress bars
+ * - Slash commands: /np, /refresh
  *
- * IMPORTANT UPDATES ADDED:
- * ✅ Rate-limit safe refresh (prevents overlap)
- * ✅ Slower hard refresh interval (30s instead of 15s)
- * ✅ presenceUpdate debounce refresh (feels live without hammering gateway)
- * ✅ Slash commands deferReply so they never time out ("application did not respond")
+ * SPLIT UPDATES (NEW):
+ * - Songs + progress snapshot every 18s (heavy: fetch presences)
+ * - Album cover rotates every 8s (light: edits embed from cached snapshot)
+ *
+ * SAFETY UPDATES:
+ * - presence debounce (configurable)
+ * - refresh lock (prevents overlapping refresh spam)
+ * - rate-limit backoff (auto slows if Discord rate-limits)
  */
 
 const express = require("express");
@@ -110,10 +114,8 @@ function makeProgressBar(positionMs, durationMs, size = 10) {
 }
 
 function getSpotifyUrlFromActivity(activity, trackFallback, artistFallback) {
-  // Discord Spotify activity usually includes syncId = track id
   if (activity?.syncId) return `https://open.spotify.com/track/${activity.syncId}`;
 
-  // Fallback: Spotify search link (still clickable)
   const q = `${trackFallback || ""} ${artistFallback || ""}`.trim();
   if (q) return `https://open.spotify.com/search/${encodeURIComponent(q)}`;
   return null;
@@ -138,22 +140,18 @@ function getSpotifyActivity(member) {
   const presence = member.presence;
   if (!presence || !presence.activities) return null;
 
-  // Spotify activity is usually named "Spotify"
   const spotify = presence.activities.find((a) => a && a.name === "Spotify");
   if (!spotify) return null;
 
   const track = spotify.details || "Unknown Track";
   const artist = spotify.state || "Unknown Artist";
 
-  // album image
   let albumUrl = null;
   if (spotify.assets && spotify.assets.largeImage) {
-    const large = spotify.assets.largeImage; // "spotify:xxxxx"
-    const id = large.replace("spotify:", "");
+    const id = spotify.assets.largeImage.replace("spotify:", "");
     albumUrl = `https://i.scdn.co/image/${id}`;
   }
 
-  // clickable url + timing for progress
   const url = getSpotifyUrlFromActivity(spotify, track, artist);
   const { positionMs, durationMs } = getSpotifyTiming(spotify);
 
@@ -161,7 +159,6 @@ function getSpotifyActivity(member) {
 }
 
 function prettyUser(member) {
-  // Prefer server nickname/display name
   return member.displayName || member.user?.username || "Unknown";
 }
 
@@ -169,6 +166,7 @@ function prettyUser(member) {
 // MESSAGE UPSERT (send once, then edit forever)
 // =====================
 async function upsertNowPlayingMessage(embed) {
+  // If bot lost access to channel, this will throw "Missing Access"
   const channel = await client.channels.fetch(CHANNEL_ID);
 
   let msg = null;
@@ -196,15 +194,66 @@ async function upsertNowPlayingMessage(embed) {
 }
 
 // =====================
-// DASHBOARD BUILD
+// DASHBOARD BUILD (SPLIT: snapshot builder + cached builder)
 // =====================
-let rotationIndex = 0;
 
-async function buildDashboardEmbed() {
+// Cached snapshot (last known listeners)
+let cachedListeners = [];
+let coverRotationIndex = 0;
+
+// Build embed from a provided listeners list (NO fetch)
+function buildEmbedFromListeners(listeners, forcedCoverUrl = null) {
+  // Rotate cover if no forced cover
+  let cover = forcedCoverUrl;
+  if (!cover && listeners.length > 0) {
+    coverRotationIndex = (coverRotationIndex + 1) % listeners.length;
+    cover = listeners[coverRotationIndex].albumUrl || null;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0x8a0606)
+    .setTitle(`Now Playing`)
+    .setDescription(
+      listeners.length
+        ? `🎧 **${listeners.length}** people listening right now`
+        : `No one is showing Spotify activity right now.`
+    )
+    .setFooter({ text: "Updates automatically from Spotify activity" })
+    .setTimestamp(new Date());
+
+  if (cover) embed.setThumbnail(cover);
+
+  if (listeners.length) {
+    const max = 20;
+    const shown = listeners.slice(0, max);
+
+    const lines = [];
+    for (const x of shown) {
+      const trackText = x.url ? `[${x.track}](${x.url})` : x.track;
+      lines.push(`**${x.user}** — *${trackText}* — ${x.artist}`);
+
+      if (x.positionMs != null && x.durationMs != null) {
+        lines.push(`\`${makeProgressBar(x.positionMs, x.durationMs, 10)}\``);
+      }
+
+      lines.push("");
+    }
+
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
+
+    if (listeners.length > max) {
+      lines.push(`…and **${listeners.length - max}** more`);
+    }
+
+    embed.addFields([{ name: "Live", value: lines.join("\n") }]);
+  }
+
+  return embed;
+}
+
+// Heavy snapshot: fetch members/presences and rebuild cachedListeners
+async function buildSnapshotAndCache() {
   const guild = await client.guilds.fetch(GUILD_ID);
-
-  // Ensure we have members + presences cached
-  // NOTE: This is the heavy call, so we protect it with rate-limit-safe scheduling
   await guild.members.fetch({ withPresences: true });
 
   const members = guild.members.cache;
@@ -225,113 +274,161 @@ async function buildDashboardEmbed() {
     });
   }
 
-  // Sort for stable output (optional)
   listeners.sort((a, b) => a.user.localeCompare(b.user));
 
-  // Rotate album cover: pick 1 listener’s album art each update
-  let cover = null;
-  if (listeners.length > 0) {
-    rotationIndex = (rotationIndex + 1) % listeners.length;
-    cover = listeners[rotationIndex].albumUrl || null;
-  }
+  cachedListeners = listeners;
 
-  const embed = new EmbedBuilder()
-    .setColor(0x8a0606) // wine red
-    .setTitle(`Now Playing in ${guild.name}`)
-    .setDescription(
-      listeners.length
-        ? `🎧 **${listeners.length}** people listening right now`
-        : `No one is showing Spotify activity right now.`
-    )
-    .setFooter({ text: "Updates automatically from Spotify activity" })
-    .setTimestamp(new Date());
+  // Keep coverRotationIndex in bounds
+  if (cachedListeners.length === 0) coverRotationIndex = 0;
+  else coverRotationIndex = coverRotationIndex % cachedListeners.length;
 
-  if (cover) embed.setThumbnail(cover);
-
-  if (listeners.length) {
-    // Limit to avoid embed length issues
-    const max = 20;
-    const shown = listeners.slice(0, max);
-
-    // Build elegant lines + add progress bar under each person
-    const lines = [];
-    for (const x of shown) {
-      const trackText = x.url ? `[${x.track}](${x.url})` : x.track;
-      lines.push(`**${x.user}** — *${trackText}* — ${x.artist}`);
-
-      // Add progress bar if we have timestamps
-      if (x.positionMs != null && x.durationMs != null) {
-        lines.push(`\`${makeProgressBar(x.positionMs, x.durationMs, 10)}\``);
-      }
-
-      lines.push(""); // blank line between people
-    }
-
-    // remove last blank line for cleaner ending
-    if (lines.length && lines[lines.length - 1] === "") lines.pop();
-
-    if (listeners.length > max) {
-      lines.push(`…and **${listeners.length - max}** more`);
-    }
-
-    embed.addFields([
-      {
-        name: "Live",
-        value: lines.join("\n"),
-      },
-    ]);
-  }
-
-  return embed;
+  return buildEmbedFromListeners(cachedListeners);
 }
 
 // =====================
-// REFRESH LOOP (UPDATED: RATE LIMIT SAFE)
+// REFRESH LOOPS (SPLIT + SAFE)
 // =====================
-let intervalHandle = null;
 
-// Rate-limit safety
-let refreshInFlight = false;
-let pendingRefresh = false;
+// ✅ Songs + progress snapshot every 18 seconds (heavy)
+const SNAPSHOT_INTERVAL_MS = 18000;
+
+// ✅ Album cover rotate every 8 seconds (light)
+const COVER_INTERVAL_MS = 8000;
+
+// ✅ Presence debounce to avoid spam (triggers snapshot)
+const PRESENCE_DEBOUNCE_MS = 3000;
+
+// ✅ Backoff if Discord rate-limits (applies to snapshot)
+let backoffMs = 0;
+const BACKOFF_STEP_MS = 10000; // +10s each time we get rate limited
+const BACKOFF_MAX_MS = 120000; // cap at 2 minutes
+
+let snapshotIntervalHandle = null;
+let coverIntervalHandle = null;
 let presenceDebounce = null;
 
-// Safer hard refresh interval (Discord gateway friendly)
-const HARD_REFRESH_INTERVAL_MS = 30000; // was 15000
+// Locks (VERY important)
+let snapshotInProgress = false;
+let snapshotQueued = false;
 
-async function refreshDashboard() {
-  // Prevent overlapping refreshes
-  if (refreshInFlight) {
-    pendingRefresh = true;
+let coverEditInProgress = false;
+
+// Optional lighter backoff for frequent cover edits
+let coverBackoffMs = 0;
+const COVER_BACKOFF_STEP_MS = 4000;
+const COVER_BACKOFF_MAX_MS = 45000;
+
+function isRateLimitish(err) {
+  const msg = (err?.message || "").toLowerCase();
+  const name = (err?.name || "").toLowerCase();
+  return (
+    msg.includes("ratelimit") ||
+    msg.includes("rate limit") ||
+    msg.includes("gatewayratelimit") ||
+    msg.includes("too many requests") ||
+    name.includes("ratelimit")
+  );
+}
+
+function isMissingAccess(err) {
+  return err?.code === 50001 || (err?.message || "").toLowerCase().includes("missing access");
+}
+
+// Heavy refresh: updates songs + progress + cache
+async function refreshSnapshot() {
+  if (snapshotInProgress) {
+    snapshotQueued = true;
     return;
   }
 
-  refreshInFlight = true;
+  snapshotInProgress = true;
 
   try {
-    const embed = await buildDashboardEmbed();
-    await upsertNowPlayingMessage(embed);
-    console.log("🔁 Dashboard refreshed.");
-  } catch (err) {
-    console.error("❌ Refresh failed:", err?.message || err);
-  } finally {
-    refreshInFlight = false;
+    if (backoffMs > 0) {
+      console.log(`⏳ Snapshot backoff: waiting ${backoffMs / 1000}s`);
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
 
-    // If something requested another refresh while we were busy, do one more pass
-    if (pendingRefresh) {
-      pendingRefresh = false;
-      setTimeout(() => refreshDashboard(), 2000);
+    const embed = await buildSnapshotAndCache();
+    await upsertNowPlayingMessage(embed);
+    console.log("🧾 Snapshot refreshed (songs/progress).");
+
+    if (backoffMs > 0) backoffMs = Math.max(0, backoffMs - BACKOFF_STEP_MS);
+  } catch (err) {
+    console.error("❌ Snapshot refresh failed:", err?.message || err);
+
+    if (isMissingAccess(err)) {
+      console.error("🚫 Missing Access: bot cannot view/send in CHANNEL_ID channel.");
+      backoffMs = BACKOFF_MAX_MS;
+    }
+
+    if (isRateLimitish(err)) {
+      backoffMs = Math.min(BACKOFF_MAX_MS, (backoffMs || 0) + BACKOFF_STEP_MS);
+      console.log(`⚠️ Rate limit detected. Snapshot backoff now ${backoffMs / 1000}s`);
+    }
+  } finally {
+    snapshotInProgress = false;
+
+    if (snapshotQueued) {
+      snapshotQueued = false;
+      setTimeout(() => refreshSnapshot(), 1500);
     }
   }
 }
 
-function startLoop() {
-  refreshDashboard();
+// Light refresh: rotate cover only using cachedListeners
+async function refreshCoverOnly() {
+  if (cachedListeners.length < 2) return; // nothing to rotate
+  if (coverEditInProgress) return;
 
-  if (intervalHandle) clearInterval(intervalHandle);
+  coverEditInProgress = true;
 
-  intervalHandle = setInterval(() => {
-    refreshDashboard();
-  }, HARD_REFRESH_INTERVAL_MS);
+  try {
+    if (coverBackoffMs > 0) {
+      await new Promise((r) => setTimeout(r, coverBackoffMs));
+    }
+
+    // Pick next cover
+    coverRotationIndex = (coverRotationIndex + 1) % cachedListeners.length;
+    const forcedCover = cachedListeners[coverRotationIndex].albumUrl || null;
+
+    // Build embed from cache with forced cover (NO fetch)
+    const embed = buildEmbedFromListeners(cachedListeners, forcedCover);
+    await upsertNowPlayingMessage(embed);
+    console.log("🖼 Cover rotated (cached).");
+
+    if (coverBackoffMs > 0) coverBackoffMs = Math.max(0, coverBackoffMs - COVER_BACKOFF_STEP_MS);
+  } catch (err) {
+    console.error("❌ Cover rotate failed:", err?.message || err);
+
+    if (isMissingAccess(err)) {
+      console.error("🚫 Missing Access during cover rotate.");
+      coverBackoffMs = COVER_BACKOFF_MAX_MS;
+    }
+
+    if (isRateLimitish(err)) {
+      coverBackoffMs = Math.min(COVER_BACKOFF_MAX_MS, coverBackoffMs + COVER_BACKOFF_STEP_MS);
+      console.log(`⚠️ Rate limit on cover edits. Cover backoff now ${coverBackoffMs / 1000}s`);
+    }
+  } finally {
+    coverEditInProgress = false;
+  }
+}
+
+function startLoops() {
+  // First snapshot populates cache
+  refreshSnapshot();
+
+  if (snapshotIntervalHandle) clearInterval(snapshotIntervalHandle);
+  if (coverIntervalHandle) clearInterval(coverIntervalHandle);
+
+  snapshotIntervalHandle = setInterval(() => {
+    refreshSnapshot();
+  }, SNAPSHOT_INTERVAL_MS);
+
+  coverIntervalHandle = setInterval(() => {
+    refreshCoverOnly();
+  }, COVER_INTERVAL_MS);
 }
 
 // =====================
@@ -340,37 +437,37 @@ function startLoop() {
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await registerCommands();
-  startLoop();
+  startLoops();
 });
 
-// Debounced refresh on presence changes (feels live without hammering gateway)
+// Presence changes trigger a faster snapshot refresh (debounced)
 client.on("presenceUpdate", () => {
-  clearTimeout(presenceDebounce);
+  if (presenceDebounce) clearTimeout(presenceDebounce);
   presenceDebounce = setTimeout(() => {
-    refreshDashboard();
-  }, 5000);
+    refreshSnapshot();
+  }, PRESENCE_DEBOUNCE_MS);
 });
 
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   try {
+    // Always acknowledge quickly so Discord doesn't time out
+    await interaction.deferReply({ ephemeral: true });
+
     if (interaction.commandName === "np" || interaction.commandName === "refresh") {
-      // Prevent "application did not respond"
-      await interaction.deferReply({ ephemeral: true });
-
-      await refreshDashboard();
-
+      await refreshSnapshot();
       await interaction.editReply(
         interaction.commandName === "np"
           ? "✅ Now Playing dashboard refreshed."
           : "🔁 Forced refresh done."
       );
+    } else {
+      await interaction.editReply("✅ Command received.");
     }
   } catch (err) {
     console.error("❌ Interaction error:", err);
     try {
-      // If deferReply happened, editReply; otherwise reply
       if (interaction.deferred) {
         await interaction.editReply("❌ Something broke while running that command.");
       } else if (!interaction.replied) {
