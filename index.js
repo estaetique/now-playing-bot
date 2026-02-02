@@ -18,7 +18,7 @@ function saveState() {
 }
 
 // Keep Render alive
-http.createServer((req, res) => res.send("Bot running")).listen(3000);
+http.createServer((req, res) => res.end("Bot running")).listen(3000);
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -45,30 +45,31 @@ async function updateNowPlaying() {
   const channel = await client.channels.fetch(channelId);
   if (!channel) return;
 
+  // Nobody listening
   if (spotifyUsers.length === 0) {
     const embed = new EmbedBuilder()
-      .setColor("#2f3136")
-      .setTitle("🎵 Now Playing")
-      .setDescription("No one is listening right now");
+      .setColor("#0e0e0e")
+      .setTitle("Now Playing")
+      .setDescription("*The room is quiet…*")
+      .setFooter({ text: "Enable Spotify activity status to appear here" });
 
-    editOrSend(channel, embed);
-    return;
+    return editOrSend(channel, embed);
   }
 
-  // Pick first listener for album art
+  // First listener provides album art
   const { activity } = spotifyUsers[0];
   const albumArt = activity.assets?.largeImageURL();
 
   let description = spotifyUsers.map(({ member, activity }) => {
-    return `**${member.user.username}** — ${activity.details} • ${activity.state}`;
-  }).join("\n");
+    return `**${member.user.username}**  \n> ${activity.details} — *${activity.state}*`;
+  }).join("\n\n");
 
   const embed = new EmbedBuilder()
-    .setColor("#1DB954")
-    .setTitle("🎵 Now Playing")
+    .setColor("#121212") // deep elegant black
+    .setAuthor({ name: "Now Playing", iconURL: "https://i.imgur.com/8kYfH3D.png" }) // subtle icon
     .setDescription(description)
     .setThumbnail(albumArt)
-    .setFooter({ text: "Updates automatically • Enable Spotify status" })
+    .setFooter({ text: "Live Spotify status • Auto updates" })
     .setTimestamp();
 
   editOrSend(channel, embed);
