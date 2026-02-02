@@ -4,6 +4,7 @@
  * - Lists multiple users currently listening to Spotify
  * - Rotates album art cover each refresh
  * - Opens a web port for Render health checks
+ * - Adds clickable Spotify links + progress bars
  */
 
 const express = require("express");
@@ -22,8 +23,8 @@ const {
 // =====================
 const TOKEN = process.env.TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID; // channel where the embed goes
-const GUILD_ID = process.env.GUILD_ID;     // your server id
-const CLIENT_ID = process.env.CLIENT_ID;   // your bot application id
+const GUILD_ID = process.env.GUILD_ID; // your server id
+const CLIENT_ID = process.env.CLIENT_ID; // your bot application id
 let MESSAGE_ID = process.env.MESSAGE_ID || ""; // message to edit (set after first run)
 
 if (!TOKEN || !CHANNEL_ID || !GUILD_ID || !CLIENT_ID) {
@@ -45,7 +46,7 @@ app.listen(PORT, () => console.log(`🌐 Web server listening on port ${PORT}`))
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,   // needed to list members
+    GatewayIntentBits.GuildMembers, // needed to list members
     GatewayIntentBits.GuildPresences, // needed to read Spotify presence
   ],
   partials: [Partials.GuildMember, Partials.User, Partials.Channel],
@@ -78,6 +79,53 @@ async function registerCommands() {
 }
 
 // =====================
+// PROGRESS BAR + LINK HELPERS (NEW)
+// =====================
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function formatTime(ms) {
+  if (!ms || ms < 0) return "0:00";
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function makeProgressBar(positionMs, durationMs, size = 10) {
+  if (!durationMs || durationMs <= 0) return "";
+  const pct = clamp(positionMs / durationMs, 0, 1);
+  const filled = Math.round(pct * size);
+  const empty = size - filled;
+
+  const bar = "▰".repeat(filled) + "▱".repeat(empty);
+  return `${bar}  ${formatTime(positionMs)} / ${formatTime(durationMs)}`;
+}
+
+function getSpotifyUrlFromActivity(activity, trackFallback, artistFallback) {
+  // Discord Spotify activity usually includes syncId = track id
+  if (activity?.syncId) return `https://open.spotify.com/track/${activity.syncId}`;
+
+  // Fallback: Spotify search link (still clickable)
+  const q = `${trackFallback || ""} ${artistFallback || ""}`.trim();
+  if (q) return `https://open.spotify.com/search/${encodeURIComponent(q)}`;
+  return null;
+}
+
+function getSpotifyTiming(activity) {
+  const start = activity?.timestamps?.start ? new Date(activity.timestamps.start).getTime() : null;
+  const end = activity?.timestamps?.end ? new Date(activity.timestamps.end).getTime() : null;
+
+  if (!start || !end) return { positionMs: null, durationMs: null };
+
+  const now = Date.now();
+  const durationMs = end - start;
+  const positionMs = clamp(now - start, 0, durationMs);
+  return { positionMs, durationMs };
+}
+
+// =====================
 // SPOTIFY HELPERS
 // =====================
 function getSpotifyActivity(member) {
@@ -88,9 +136,6 @@ function getSpotifyActivity(member) {
   const spotify = presence.activities.find((a) => a && a.name === "Spotify");
   if (!spotify) return null;
 
-  // spotify.details = track name
-  // spotify.state = artist name(s)
-  // spotify.assets.largeImage = "spotify:ab67616d0000b273...."
   const track = spotify.details || "Unknown Track";
   const artist = spotify.state || "Unknown Artist";
 
@@ -102,7 +147,11 @@ function getSpotifyActivity(member) {
     albumUrl = `https://i.scdn.co/image/${id}`;
   }
 
-  return { track, artist, albumUrl };
+  // clickable url + timing for progress
+  const url = getSpotifyUrlFromActivity(spotify, track, artist);
+  const { positionMs, durationMs } = getSpotifyTiming(spotify);
+
+  return { track, artist, albumUrl, url, positionMs, durationMs };
 }
 
 function prettyUser(member) {
@@ -149,11 +198,9 @@ async function buildDashboardEmbed() {
   const guild = await client.guilds.fetch(GUILD_ID);
 
   // Ensure we have members + presences cached
-  // This fetch helps a LOT when the bot just restarted.
   await guild.members.fetch({ withPresences: true });
 
   const members = guild.members.cache;
-
   const listeners = [];
 
   for (const [, member] of members) {
@@ -165,6 +212,9 @@ async function buildDashboardEmbed() {
       track: spotify.track,
       artist: spotify.artist,
       albumUrl: spotify.albumUrl,
+      url: spotify.url,
+      positionMs: spotify.positionMs,
+      durationMs: spotify.durationMs,
     });
   }
 
@@ -192,14 +242,26 @@ async function buildDashboardEmbed() {
   if (cover) embed.setThumbnail(cover);
 
   if (listeners.length) {
-    // Keep it elegant + readable
     // Limit to avoid embed length issues
     const max = 20;
     const shown = listeners.slice(0, max);
 
-    const lines = shown.map(
-      (x) => `**${x.user}** — *${x.track}* — ${x.artist}`
-    );
+    // Build elegant lines + add progress bar under each person
+    const lines = [];
+    for (const x of shown) {
+      const trackText = x.url ? `[${x.track}](${x.url})` : x.track;
+      lines.push(`**${x.user}** — *${trackText}* — ${x.artist}`);
+
+      // Add progress bar if we have timestamps
+      if (x.positionMs != null && x.durationMs != null) {
+        lines.push(`\`${makeProgressBar(x.positionMs, x.durationMs, 10)}\``);
+      }
+
+      lines.push(""); // blank line between people
+    }
+
+    // remove last blank line for cleaner ending
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
 
     if (listeners.length > max) {
       lines.push(`…and **${listeners.length - max}** more`);
