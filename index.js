@@ -1,114 +1,93 @@
 const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const fs = require("fs");
-const express = require("express");
+const http = require("http");
 
-// 🌐 Required for Render Web Service (keeps bot alive)
-const app = express();
-app.get("/", (req, res) => res.send("Now Playing Bot is running"));
-app.listen(process.env.PORT || 3000);
-
-// 🔐 Environment variables from Render
 const token = process.env.BOT_TOKEN;
 const channelId = process.env.CHANNEL_ID;
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildPresences
-  ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildPresences],
 });
 
-// 💾 Remember message ID so bot edits instead of spamming
-function loadState() {
-  try {
-    return JSON.parse(fs.readFileSync("./state.json", "utf8"));
-  } catch {
-    return {};
-  }
+let state = {};
+try { state = JSON.parse(fs.readFileSync("./state.json")); } catch {}
+let messageId = state.messageId || null;
+
+function saveState() {
+  fs.writeFileSync("./state.json", JSON.stringify({ messageId }, null, 2));
 }
 
-function saveState(state) {
-  fs.writeFileSync("./state.json", JSON.stringify(state, null, 2));
-}
-
-let state = loadState();
-let dashboardMessage = state.dashboardMessageId || null;
-let coverIndex = 0;
-let refreshTimer = null;
+// Keep Render alive
+http.createServer((req, res) => res.send("Bot running")).listen(3000);
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  await refreshNowPlaying();
-
-  // 🔁 Auto refresh every 15 seconds
-  setInterval(refreshNowPlaying, 15000);
+  updateNowPlaying();
+  setInterval(updateNowPlaying, 15000);
 });
 
 client.on("presenceUpdate", () => {
-  clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(refreshNowPlaying, 1500);
+  setTimeout(updateNowPlaying, 3000);
 });
 
-function pickSpotifyActivity(member) {
-  return member.presence?.activities?.find(a => a.name === "Spotify");
+async function updateNowPlaying() {
+  const guild = client.guilds.cache.first();
+  if (!guild) return;
+
+  const members = await guild.members.fetch();
+  const spotifyUsers = [];
+
+  members.forEach(member => {
+    const activity = member.presence?.activities?.find(a => a.type === 2 && a.name === "Spotify");
+    if (activity) spotifyUsers.push({ member, activity });
+  });
+
+  const channel = await client.channels.fetch(channelId);
+  if (!channel) return;
+
+  if (spotifyUsers.length === 0) {
+    const embed = new EmbedBuilder()
+      .setColor("#2f3136")
+      .setTitle("🎵 Now Playing")
+      .setDescription("No one is listening right now");
+
+    editOrSend(channel, embed);
+    return;
+  }
+
+  // Pick first listener for album art
+  const { activity } = spotifyUsers[0];
+  const albumArt = activity.assets?.largeImageURL();
+
+  let description = spotifyUsers.map(({ member, activity }) => {
+    return `**${member.user.username}** — ${activity.details} • ${activity.state}`;
+  }).join("\n");
+
+  const embed = new EmbedBuilder()
+    .setColor("#1DB954")
+    .setTitle("🎵 Now Playing")
+    .setDescription(description)
+    .setThumbnail(albumArt)
+    .setFooter({ text: "Updates automatically • Enable Spotify status" })
+    .setTimestamp();
+
+  editOrSend(channel, embed);
 }
 
-async function refreshNowPlaying() {
+async function editOrSend(channel, embed) {
   try {
-    const channel = await client.channels.fetch(channelId).catch(() => null);
-    if (!channel) return;
-
-    const guild = channel.guild;
-    await guild.members.fetch({ withPresences: true }).catch(() => {});
-
-    const listeners = [];
-    const covers = [];
-
-    for (const [, member] of guild.members.cache) {
-      const spotify = pickSpotifyActivity(member);
-      if (!spotify) continue;
-
-      listeners.push(
-        `🎵 **${spotify.details}** — *${spotify.state}*\n👤 ${member.user.username}`
-      );
-
-      covers.push(spotify.assets?.largeImageURL?.());
-    }
-
-    const embed = new EmbedBuilder()
-      .setColor("#1DB954") // Spotify green
-      .setTitle("🎧 Now Playing in Chaos Club")
-      .setDescription(
-        listeners.length
-          ? `🎶 **${listeners.length} people listening right now**\n\n` + listeners.join("\n\n")
-          : "Nobody is vibing to Spotify right now 😔"
-      )
-      .setFooter({
-        text: "Updates automatically • Turn on Spotify activity",
-        iconURL: "https://cdn-icons-png.flaticon.com/512/174/174872.png"
-      })
-      .setTimestamp();
-
-    // 🔁 Rotating album art
-    if (covers.length) {
-      embed.setThumbnail(covers[coverIndex % covers.length]);
-      coverIndex++;
-    }
-
-    if (!dashboardMessage) {
-      const msg = await channel.send({ embeds: [embed] });
-      dashboardMessage = msg.id;
-      state.dashboardMessageId = msg.id;
-      saveState(state);
+    if (messageId) {
+      const msg = await channel.messages.fetch(messageId);
+      await msg.edit({ embeds: [embed] });
     } else {
-      const msg = await channel.messages.fetch(dashboardMessage).catch(() => null);
-      if (msg) await msg.edit({ embeds: [embed] });
+      const msg = await channel.send({ embeds: [embed] });
+      messageId = msg.id;
+      saveState();
     }
-
-    console.log("Refreshed now playing (pretty mode)");
-  } catch (err) {
-    console.error("Refresh error:", err.message);
+  } catch {
+    const msg = await channel.send({ embeds: [embed] });
+    messageId = msg.id;
+    saveState();
   }
 }
 
