@@ -1,87 +1,103 @@
-const { Client, GatewayIntentBits, EmbedBuilder, REST, Routes, SlashCommandBuilder } = require("discord.js");
+const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const fs = require("fs");
+const express = require("express");
 
+// 🌐 REQUIRED for Render (keeps service alive)
+const app = express();
+app.get("/", (req, res) => res.send("Bot is running"));
+app.listen(process.env.PORT || 3000);
+
+// 🔐 Tokens from Render Environment Variables
 const token = process.env.BOT_TOKEN;
 const channelId = process.env.CHANNEL_ID;
-const clientId = process.env.CLIENT_ID; // add this in Render later
-const guildId = process.env.GUILD_ID;   // add this too
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildPresences]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildPresences
+  ]
 });
 
-let dashboardMessage = null;
-let coverIndex = 0;
-
-async function updateNowPlaying() {
-  const channel = await client.channels.fetch(channelId).catch(() => null);
-  if (!channel) return;
-
-  const guild = channel.guild;
-  await guild.members.fetch({ withPresences: true });
-
-  const members = guild.members.cache.filter(m =>
-    m.presence?.activities?.some(a => a.name === "Spotify")
-  );
-
-  if (!members.size) {
-    const text = "🎵 **Now Playing**\nNo one is listening right now.";
-    if (!dashboardMessage) dashboardMessage = await channel.send(text);
-    else await dashboardMessage.edit(text);
-    return;
+// 💾 Save message ID so bot edits instead of spamming
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync("./state.json", "utf8"));
+  } catch {
+    return {};
   }
-
-  const embeds = [];
-  members.forEach(member => {
-    const activity = member.presence.activities.find(a => a.name === "Spotify");
-    const embed = new EmbedBuilder()
-      .setColor("#1DB954")
-      .setAuthor({ name: member.user.username })
-      .setTitle(activity.details)
-      .setDescription(`by **${activity.state}**`)
-      .setThumbnail(activity.assets.largeImageURL());
-    embeds.push(embed);
-  });
-
-  if (!dashboardMessage) dashboardMessage = await channel.send({ embeds });
-  else await dashboardMessage.edit({ embeds });
 }
+
+function saveState(state) {
+  fs.writeFileSync("./state.json", JSON.stringify(state, null, 2));
+}
+
+let state = loadState();
+let dashboardMessage = state.dashboardMessageId || null;
+let coverIndex = 0;
+let refreshTimer = null;
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  await refreshNowPlaying();
 
-  const commands = [
-    new SlashCommandBuilder().setName("np").setDescription("Refresh Now Playing"),
-    new SlashCommandBuilder().setName("ping").setDescription("Check if bot is alive"),
-    new SlashCommandBuilder().setName("setchannel").setDescription("Set Now Playing channel")
-      .addChannelOption(option =>
-        option.setName("channel")
-          .setDescription("Channel to post in")
-          .setRequired(true))
-  ].map(cmd => cmd.toJSON());
-
-  const rest = new REST({ version: "10" }).setToken(token);
-  await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
-
-  updateNowPlaying();
-  setInterval(updateNowPlaying, 15000);
+  // 🔁 Auto refresh every 15 sec
+  setInterval(refreshNowPlaying, 15000);
 });
 
-client.on("interactionCreate", async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.commandName === "ping") {
-    await interaction.reply("🏓 Pong! Bot is online.");
-  }
-
-  if (interaction.commandName === "np") {
-    await updateNowPlaying();
-    await interaction.reply("🔄 Refreshed Now Playing!");
-  }
-
-  if (interaction.commandName === "setchannel") {
-    await interaction.reply("⚠️ Channel changing not saved yet (advanced feature).");
-  }
+client.on("presenceUpdate", () => {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(refreshNowPlaying, 1500);
 });
+
+function pickSpotifyActivity(member) {
+  return member.presence?.activities?.find(a => a.name === "Spotify");
+}
+
+async function refreshNowPlaying() {
+  try {
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (!channel) return;
+
+    const guild = channel.guild;
+    await guild.members.fetch({ withPresences: true }).catch(() => {});
+
+    const lines = [];
+    const covers = [];
+
+    for (const [, member] of guild.members.cache) {
+      const spotify = pickSpotifyActivity(member);
+      if (!spotify) continue;
+
+      lines.push(`**${member.user.username}** — ${spotify.details} • ${spotify.state}`);
+      covers.push(spotify.assets?.largeImageURL?.());
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle("🎵 Now Playing")
+      .setDescription(lines.length ? lines.join("\n") : "No one is listening to Spotify right now.")
+      .setColor("#1DB954")
+      .setFooter({ text: "Updates automatically • Enable Spotify activity status" });
+
+    if (covers.length) {
+      embed.setThumbnail(covers[coverIndex % covers.length]);
+      coverIndex++;
+    }
+
+    if (!dashboardMessage) {
+      const msg = await channel.send({ embeds: [embed] });
+      dashboardMessage = msg.id;
+      state.dashboardMessageId = msg.id;
+      saveState(state);
+    } else {
+      const msg = await channel.messages.fetch(dashboardMessage).catch(() => null);
+      if (msg) await msg.edit({ embeds: [embed] });
+    }
+
+    console.log("Refreshed now playing...");
+  } catch (err) {
+    console.error("Refresh error:", err.message);
+  }
+}
 
 client.login(token);
