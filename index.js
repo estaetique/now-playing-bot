@@ -12,12 +12,13 @@ const client = new Client({
 let state = {};
 try { state = JSON.parse(fs.readFileSync("./state.json")); } catch {}
 let messageId = state.messageId || null;
+let coverIndex = 0;
 
 function saveState() {
   fs.writeFileSync("./state.json", JSON.stringify({ messageId }, null, 2));
 }
 
-// Keep Render alive
+// Keep Render web service alive
 http.createServer((req, res) => res.end("Bot running")).listen(3000);
 
 client.once("ready", async () => {
@@ -45,31 +46,36 @@ async function updateNowPlaying() {
   const channel = await client.channels.fetch(channelId);
   if (!channel) return;
 
-  // Nobody listening
+  // No listeners
   if (spotifyUsers.length === 0) {
     const embed = new EmbedBuilder()
-      .setColor("#0e0e0e")
+      .setColor("#0c0c0c")
       .setTitle("Now Playing")
-      .setDescription("*The room is quiet…*")
+      .setDescription("━━━━━━━━━━━━━━━━━━\n*Silence fills the room…*\n━━━━━━━━━━━━━━━━━━")
       .setFooter({ text: "Enable Spotify activity status to appear here" });
 
     return editOrSend(channel, embed);
   }
 
-  // First listener provides album art
-  const { activity } = spotifyUsers[0];
-  const albumArt = activity.assets?.largeImageURL();
+  // Rotate album covers
+  coverIndex = (coverIndex + 1) % spotifyUsers.length;
+  const albumArt = spotifyUsers[coverIndex].activity.assets?.largeImageURL();
+
+  // Elegant equalizer vibe
+  const bars = ["▁▂▃▅▇", "▂▅▇▅▂", "▇▆▅▄▃", "▃▄▅▆▇"];
+  const equalizer = bars[Math.floor(Date.now() / 1500) % bars.length];
 
   let description = spotifyUsers.map(({ member, activity }) => {
-    return `**${member.user.username}**  \n> ${activity.details} — *${activity.state}*`;
+    return `**${member.user.username}**\n> ${activity.details}\n> *${activity.state}*`;
   }).join("\n\n");
 
   const embed = new EmbedBuilder()
-    .setColor("#121212") // deep elegant black
-    .setAuthor({ name: "Now Playing", iconURL: "https://i.imgur.com/8kYfH3D.png" }) // subtle icon
-    .setDescription(description)
+    .setColor("#111111")
+    .setAuthor({ name: "Now Playing", iconURL: "https://i.imgur.com/8kYfH3D.png" })
+    .setDescription(`━━━━━━━━━━━━━━━━━━\n${description}\n━━━━━━━━━━━━━━━━━━`)
+    .addFields({ name: "Live Audio", value: `\`${equalizer}\`` })
     .setThumbnail(albumArt)
-    .setFooter({ text: "Live Spotify status • Auto updates" })
+    .setFooter({ text: "Live Spotify status • Updates automatically" })
     .setTimestamp();
 
   editOrSend(channel, embed);
