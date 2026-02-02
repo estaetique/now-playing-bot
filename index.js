@@ -18,7 +18,7 @@ function saveState() {
   fs.writeFileSync("./state.json", JSON.stringify({ messageId }, null, 2));
 }
 
-// Keep Render web service alive
+// Keeps Render web service alive
 http.createServer((req, res) => res.end("Bot running")).listen(3000);
 
 client.once("ready", async () => {
@@ -49,26 +49,26 @@ async function updateNowPlaying() {
   // No one listening
   if (spotifyUsers.length === 0) {
     const embed = new EmbedBuilder()
-      .setColor("#0f0f0f")
+      .setColor("#8a0606") // 🍷 Your custom wine red
       .setTitle("Now Playing")
-      .setDescription("────────────────────\nNo one is listening right now\n────────────────────")
+      .setDescription("──────────────\nNo one is listening right now\n──────────────")
       .setFooter({ text: "Enable Spotify activity status to appear here" });
 
     return editOrSend(channel, embed);
   }
 
-  // Rotate album art
+  // Rotate album covers
   coverIndex = (coverIndex + 1) % spotifyUsers.length;
   const albumArt = spotifyUsers[coverIndex].activity.assets?.largeImageURL();
 
   let description = spotifyUsers.map(({ member, activity }) => {
-    return `**${activity.details}**\n${activity.state}\n*${member.user.username}*`;
+    return `♬ **${activity.details}**\n${activity.state}\n*${member.user.username}*`;
   }).join("\n\n");
 
   const embed = new EmbedBuilder()
-    .setColor("#0f0f0f")
+    .setColor("#8a0606") // 🍷 Elegant wine red side bar
     .setTitle("Now Playing")
-    .setDescription(`────────────────────\n${description}\n────────────────────`)
+    .setDescription(`──────────────\n${description}\n──────────────`)
     .setThumbnail(albumArt)
     .setFooter({ text: "Live Spotify activity • Updates automatically" })
     .setTimestamp();
