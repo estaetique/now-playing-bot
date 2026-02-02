@@ -1,96 +1,193 @@
 const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const fs = require("fs");
-const http = require("http");
 
+// ====== ENV ======
 const token = process.env.BOT_TOKEN;
 const channelId = process.env.CHANNEL_ID;
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildPresences],
-});
-
-let state = {};
-try { state = JSON.parse(fs.readFileSync("./state.json")); } catch {}
-let messageId = state.messageId || null;
-let coverIndex = 0;
-
-function saveState() {
-  fs.writeFileSync("./state.json", JSON.stringify({ messageId }, null, 2));
+if (!token || !channelId) {
+  console.error("Missing BOT_TOKEN or CHANNEL_ID in environment variables.");
+  process.exit(1);
 }
 
-// Keeps Render web service alive
-http.createServer((req, res) => res.end("Bot running")).listen(3000);
-
-client.once("ready", async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  updateNowPlaying();
-  setInterval(updateNowPlaying, 15000);
+// ====== CLIENT ======
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildPresences, // needed to read Spotify activity
+  ],
 });
 
-client.on("presenceUpdate", () => {
-  setTimeout(updateNowPlaying, 3000);
-});
+// ====== STATE (persist message ID + cover index) ======
+const STATE_FILE = "./state.json";
 
-async function updateNowPlaying() {
-  const guild = client.guilds.cache.first();
-  if (!guild) return;
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
 
-  const members = await guild.members.fetch();
-  const spotifyUsers = [];
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
 
-  members.forEach(member => {
-    const activity = member.presence?.activities?.find(a => a.type === 2 && a.name === "Spotify");
-    if (activity) spotifyUsers.push({ member, activity });
-  });
+let state = loadState();
+let dashboardMessageId = state.dashboardMessageId || null;
+let coverIndex = Number.isInteger(state.coverIndex) ? state.coverIndex : 0;
 
-  const channel = await client.channels.fetch(channelId);
-  if (!channel) return;
+let dashboardMessage = null;
+let refreshTimer = null;
+let debounceTimer = null;
 
-  // No one listening
-  if (spotifyUsers.length === 0) {
-    const embed = new EmbedBuilder()
-      .setColor("#8a0606") // 🍷 Your custom wine red
-      .setTitle("Now Playing")
-      .setDescription("──────────────\nNo one is listening right now\n──────────────")
-      .setFooter({ text: "Enable Spotify activity status to appear here" });
+// ====== HELPERS ======
+function spotifyCoverUrl(activity) {
+  // activity.assets.largeImage looks like: "spotify:ab67616d0000b273...."
+  const large = activity?.assets?.largeImage;
+  if (!large || !large.startsWith("spotify:")) return null;
+  const id = large.replace("spotify:", "");
+  return `https://i.scdn.co/image/${id}`;
+}
 
-    return editOrSend(channel, embed);
+function getSpotifyActivityFromPresence(presence) {
+  const activities = presence?.activities || [];
+  // Spotify activity usually has name "Spotify"
+  return activities.find((a) => a?.name === "Spotify" && (a?.details || a?.state));
+}
+
+function pickElegantLines(guild, maxLines = 6) {
+  // Use presences cache (fast, no giant fetch)
+  const presences = guild?.presences?.cache;
+  if (!presences) return { lines: [], covers: [], count: 0 };
+
+  const results = [];
+
+  for (const [userId, presence] of presences) {
+    const sp = getSpotifyActivityFromPresence(presence);
+    if (!sp) continue;
+
+    const member = guild.members.cache.get(userId);
+    const display = member?.displayName || presence?.user?.username || "unknown";
+
+    const track = sp.details || "Unknown track";
+    const artist = sp.state || "Unknown artist";
+
+    results.push({
+      display,
+      track,
+      artist,
+      cover: spotifyCoverUrl(sp),
+    });
   }
 
-  // Rotate album covers
-  coverIndex = (coverIndex + 1) % spotifyUsers.length;
-  const albumArt = spotifyUsers[coverIndex].activity.assets?.largeImageURL();
+  // Sort so the list is stable (prettier, less jumping)
+  results.sort((a, b) => a.display.localeCompare(b.display));
 
-  let description = spotifyUsers.map(({ member, activity }) => {
-    return `♬ **${activity.details}**\n${activity.state}\n*${member.user.username}*`;
-  }).join("\n\n");
+  const lines = results.slice(0, maxLines).map((r) => `• **${r.display}** — ${r.track} *(${r.artist})*`);
+  const covers = results.map((r) => r.cover).filter(Boolean);
+
+  return { lines, covers, count: results.length };
+}
+
+async function getOrCreateDashboardMessage(channel) {
+  // Try existing saved message
+  if (dashboardMessageId) {
+    try {
+      const msg = await channel.messages.fetch(dashboardMessageId);
+      return msg;
+    } catch {
+      // message deleted or not accessible
+      dashboardMessageId = null;
+    }
+  }
+
+  // Create new
+  const placeholder = new EmbedBuilder()
+    .setColor(0x8a0606)
+    .setTitle("Now Playing")
+    .setDescription("Listening…")
+    .setFooter({ text: "Updates automatically • Turn on Spotify activity status" })
+    .setTimestamp(new Date());
+
+  const msg = await channel.send({ embeds: [placeholder] });
+  dashboardMessageId = msg.id;
+  state.dashboardMessageId = dashboardMessageId;
+  saveState(state);
+  return msg;
+}
+
+// ====== MAIN REFRESH ======
+async function refreshNowPlaying() {
+  if (!dashboardMessage) return;
+
+  const channel = dashboardMessage.channel;
+  const guild = channel.guild;
+
+  const { lines, covers, count } = pickElegantLines(guild, 6);
+
+  // Rotate cover
+  let cover = null;
+  if (covers.length) {
+    cover = covers[coverIndex % covers.length];
+    coverIndex = (coverIndex + 1) % 1000000;
+    state.coverIndex = coverIndex;
+    saveState(state);
+  }
+
+  const title = "Now Playing";
+  const subtitle = count ? `**${count}** listening right now` : "No one is showing Spotify activity right now.";
 
   const embed = new EmbedBuilder()
-    .setColor("#8a0606") // 🍷 Elegant wine red side bar
-    .setTitle("Now Playing")
-    .setDescription(`──────────────\n${description}\n──────────────`)
-    .setThumbnail(albumArt)
-    .setFooter({ text: "Live Spotify activity • Updates automatically" })
-    .setTimestamp();
+    .setColor(0x8a0606) // wine red bar
+    .setTitle(title)
+    .setDescription(`${subtitle}\n\n${lines.length ? lines.join("\n") : "• *(Nothing to show yet)*"}`)
+    .setFooter({ text: "Updates automatically • Turn on Spotify activity status" })
+    .setTimestamp(new Date());
 
-  editOrSend(channel, embed);
-}
+  if (cover) embed.setThumbnail(cover);
 
-async function editOrSend(channel, embed) {
   try {
-    if (messageId) {
-      const msg = await channel.messages.fetch(messageId);
-      await msg.edit({ embeds: [embed] });
-    } else {
-      const msg = await channel.send({ embeds: [embed] });
-      messageId = msg.id;
-      saveState();
-    }
-  } catch {
-    const msg = await channel.send({ embeds: [embed] });
-    messageId = msg.id;
-    saveState();
+    await dashboardMessage.edit({ embeds: [embed] });
+  } catch (e) {
+    console.log("edit failed:", e?.message || e);
   }
 }
+
+// Debounce refresh so presence spam doesn’t hammer edits
+function requestRefreshSoon() {
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    refreshNowPlaying().catch(() => {});
+  }, 1500);
+}
+
+// ====== READY ======
+client.once("ready", async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel) {
+    console.error("Could not fetch channel. Check CHANNEL_ID and bot permissions.");
+    process.exit(1);
+  }
+
+  dashboardMessage = await getOrCreateDashboardMessage(channel);
+
+  // First refresh
+  await refreshNowPlaying().catch(() => {});
+
+  // Fallback interval refresh (keeps it moving even if events are missed)
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => {
+    refreshNowPlaying().catch(() => {});
+  }, 7000); // 7s feels “near-live” without being spammy
+});
+
+// ====== LIVE PRESENCE UPDATES ======
+client.on("presenceUpdate", () => {
+  // Don’t try to fetch all members — just refresh from cache
+  requestRefreshSoon();
+});
 
 client.login(token);
