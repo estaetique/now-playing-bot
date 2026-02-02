@@ -46,36 +46,31 @@ async function updateNowPlaying() {
   const channel = await client.channels.fetch(channelId);
   if (!channel) return;
 
-  // No listeners
+  // No one listening
   if (spotifyUsers.length === 0) {
     const embed = new EmbedBuilder()
-      .setColor("#0c0c0c")
+      .setColor("#0f0f0f")
       .setTitle("Now Playing")
-      .setDescription("━━━━━━━━━━━━━━━━━━\n*Silence fills the room…*\n━━━━━━━━━━━━━━━━━━")
+      .setDescription("────────────────────\nNo one is listening right now\n────────────────────")
       .setFooter({ text: "Enable Spotify activity status to appear here" });
 
     return editOrSend(channel, embed);
   }
 
-  // Rotate album covers
+  // Rotate album art
   coverIndex = (coverIndex + 1) % spotifyUsers.length;
   const albumArt = spotifyUsers[coverIndex].activity.assets?.largeImageURL();
 
-  // Elegant equalizer vibe
-  const bars = ["▁▂▃▅▇", "▂▅▇▅▂", "▇▆▅▄▃", "▃▄▅▆▇"];
-  const equalizer = bars[Math.floor(Date.now() / 1500) % bars.length];
-
   let description = spotifyUsers.map(({ member, activity }) => {
-    return `**${member.user.username}**\n> ${activity.details}\n> *${activity.state}*`;
+    return `**${activity.details}**\n${activity.state}\n*${member.user.username}*`;
   }).join("\n\n");
 
   const embed = new EmbedBuilder()
-    .setColor("#111111")
-    .setAuthor({ name: "Now Playing", iconURL: "https://i.imgur.com/8kYfH3D.png" })
-    .setDescription(`━━━━━━━━━━━━━━━━━━\n${description}\n━━━━━━━━━━━━━━━━━━`)
-    .addFields({ name: "Live Audio", value: `\`${equalizer}\`` })
+    .setColor("#0f0f0f")
+    .setTitle("Now Playing")
+    .setDescription(`────────────────────\n${description}\n────────────────────`)
     .setThumbnail(albumArt)
-    .setFooter({ text: "Live Spotify status • Updates automatically" })
+    .setFooter({ text: "Live Spotify activity • Updates automatically" })
     .setTimestamp();
 
   editOrSend(channel, embed);
