@@ -1,51 +1,77 @@
-const { Client, GatewayIntentBits, Partials, ActivityType, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
 require('dotenv').config();
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildPresences,
-    GatewayIntentBits.GuildMembers
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildPresences
   ],
   partials: [Partials.GuildMember]
 });
 
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const WINE_RED = '#8a0606';
 
-client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  console.log('🎵 Spotify Now Playing Bot is live');
-});
+let currentMessage = null;
+let albumRotationIndex = 0;
 
-client.on('presenceUpdate', async (oldPresence, newPresence) => {
-  if (!newPresence || !newPresence.activities) return;
+function createEmbed(listeners) {
+  const covers = listeners.map(l => l.albumArt).filter(Boolean);
+  const cover = covers[albumRotationIndex % covers.length];
 
-  const spotifyActivity = newPresence.activities.find(
-    a => a.type === ActivityType.Listening && a.name === 'Spotify'
-  );
+  return new EmbedBuilder()
+    .setColor(WINE_RED)
+    .setTitle('🎧 Now Playing')
+    .setDescription(
+      listeners.map(l =>
+        `**${l.username}**\n> 🎵 ${l.song}\n> 🎤 ${l.artist}`
+      ).join('\n\n')
+    )
+    .setThumbnail(cover || null)
+    .setFooter({ text: 'Updates automatically from Spotify activity' });
+}
 
-  if (!spotifyActivity) return;
-
-  const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
+async function updateNowPlaying() {
+  const channel = await client.channels.fetch(CHANNEL_ID);
   if (!channel) return;
 
-  const embed = new EmbedBuilder()
-    .setColor('#8a0606') // wine red
-    .setAuthor({ name: 'Now Playing', iconURL: 'https://cdn-icons-png.flaticon.com/512/727/727245.png' })
-    .setTitle(spotifyActivity.details)
-    .setDescription(`by **${spotifyActivity.state}**`)
-    .setThumbnail(spotifyActivity.assets?.largeImageURL() || null)
-    .setFooter({ text: 'Updates automatically from Spotify activity' })
-    .setTimestamp();
+  const members = await channel.guild.members.fetch({ withPresences: true });
 
-  const messages = await channel.messages.fetch({ limit: 5 });
-  const botMessage = messages.find(m => m.author.id === client.user.id);
+  const listeners = [];
 
-  if (botMessage) {
-    botMessage.edit({ embeds: [embed] });
+  members.forEach(member => {
+    const activity = member.presence?.activities.find(a => a.type === 2 && a.name === 'Spotify');
+    if (!activity) return;
+
+    listeners.push({
+      username: member.displayName,
+      song: activity.details,
+      artist: activity.state,
+      albumArt: activity.assets?.largeImageURL?.()
+    });
+  });
+
+  if (listeners.length === 0) return;
+
+  const embed = createEmbed(listeners);
+
+  if (!currentMessage) {
+    currentMessage = await channel.send({ embeds: [embed] });
   } else {
-    channel.send({ embeds: [embed] });
+    await currentMessage.edit({ embeds: [embed] });
   }
+
+  albumRotationIndex++;
+}
+
+client.on('presenceUpdate', () => {
+  updateNowPlaying();
 });
 
-client.login(process.env.TOKEN);
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  setInterval(updateNowPlaying, 15000); // rotates album art every 15s
+});
+
+client.login(process.env.DISCORD_TOKEN);
