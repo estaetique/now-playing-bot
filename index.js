@@ -2,23 +2,6 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const express = require('express');
 
-const app = express();
-
-/* ================== KEEP RENDER HAPPY ================== */
-const PORT = process.env.PORT || 3000;
-
-app.get('/', (req, res) => {
-  res.send('Now Playing Bot is running 🎵');
-});
-
-app.listen(PORT, () => {
-  console.log(`🌐 Web server listening on port ${PORT}`);
-});
-/* ======================================================= */
-
-
-/* ================== DISCORD BOT ================== */
-
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -27,33 +10,71 @@ const client = new Client({
   ]
 });
 
-client.once('ready', () => {
-  console.log(`🤖 Logged in as ${client.user.tag}`);
+const app = express();
+app.get('/', (req, res) => res.send('Bot is alive!'));
+app.listen(process.env.PORT || 3000);
+
+const CHANNEL_ID = process.env.CHANNEL_ID;
+let nowPlayingMessage = null;
+let lastSongs = new Map();
+
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  const channel = await client.channels.fetch(CHANNEL_ID);
+
+  // Send ONE master message when bot starts
+  nowPlayingMessage = await channel.send({ content: "🎵 Loading Now Playing..." });
 });
 
 client.on('presenceUpdate', async (oldPresence, newPresence) => {
-  if (!newPresence || !newPresence.activities) return;
+  if (!newPresence?.activities) return;
 
-  const spotifyActivity = newPresence.activities.find(
-    activity => activity.type === 2 && activity.name === 'Spotify'
-  );
-
+  const spotifyActivity = newPresence.activities.find(a => a.name === 'Spotify');
   if (!spotifyActivity) return;
 
-  const channel = await client.channels.fetch(process.env.CHANNEL_ID);
-  if (!channel) return;
+  const userId = newPresence.userId;
+  const songKey = `${spotifyActivity.details}-${spotifyActivity.state}`;
+
+  if (lastSongs.get(userId) === songKey) return;
+  lastSongs.set(userId, songKey);
+
+  updateNowPlaying();
+});
+
+async function updateNowPlaying() {
+  const channel = await client.channels.fetch(CHANNEL_ID);
+  const members = await channel.guild.members.fetch();
+
+  const spotifyUsers = members.filter(member =>
+    member.presence?.activities?.some(a => a.name === 'Spotify')
+  );
+
+  if (spotifyUsers.size === 0) {
+    await nowPlayingMessage.edit("No one is listening right now.");
+    return;
+  }
 
   const embed = new EmbedBuilder()
-    .setColor('#8a0606')
-    .setAuthor({ name: 'Now Playing 🎧' })
-    .setDescription(
-      `**${spotifyActivity.details}**\nby *${spotifyActivity.state}*\n\n👤 ${newPresence.user.username}`
-    )
-    .setThumbnail(spotifyActivity.assets.largeImageURL())
-    .setFooter({ text: 'Live Spotify activity' })
-    .setTimestamp();
+    .setTitle("🎧 Now Playing in Chaos Club")
+    .setColor("#8a0606");
 
-  channel.send({ embeds: [embed] });
-});
+  spotifyUsers.forEach(member => {
+    const activity = member.presence.activities.find(a => a.name === 'Spotify');
+
+    embed.addFields({
+      name: `${activity.details}`,
+      value: `by **${activity.state}**\n👤 ${member.user.username}`,
+      inline: false
+    });
+
+    if (activity.assets?.largeImage) {
+      const imageUrl = `https://i.scdn.co/image/${activity.assets.largeImage.replace('spotify:', '')}`;
+      embed.setThumbnail(imageUrl);
+    }
+  });
+
+  await nowPlayingMessage.edit({ embeds: [embed] });
+}
 
 client.login(process.env.TOKEN);
