@@ -2,12 +2,12 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const fs = require("fs");
 const express = require("express");
 
-// 🌐 REQUIRED for Render (keeps service alive)
+// 🌐 Required for Render Web Service (keeps bot alive)
 const app = express();
-app.get("/", (req, res) => res.send("Bot is running"));
+app.get("/", (req, res) => res.send("Now Playing Bot is running"));
 app.listen(process.env.PORT || 3000);
 
-// 🔐 Tokens from Render Environment Variables
+// 🔐 Environment variables from Render
 const token = process.env.BOT_TOKEN;
 const channelId = process.env.CHANNEL_ID;
 
@@ -19,7 +19,7 @@ const client = new Client({
   ]
 });
 
-// 💾 Save message ID so bot edits instead of spamming
+// 💾 Remember message ID so bot edits instead of spamming
 function loadState() {
   try {
     return JSON.parse(fs.readFileSync("./state.json", "utf8"));
@@ -41,7 +41,7 @@ client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   await refreshNowPlaying();
 
-  // 🔁 Auto refresh every 15 sec
+  // 🔁 Auto refresh every 15 seconds
   setInterval(refreshNowPlaying, 15000);
 });
 
@@ -62,23 +62,35 @@ async function refreshNowPlaying() {
     const guild = channel.guild;
     await guild.members.fetch({ withPresences: true }).catch(() => {});
 
-    const lines = [];
+    const listeners = [];
     const covers = [];
 
     for (const [, member] of guild.members.cache) {
       const spotify = pickSpotifyActivity(member);
       if (!spotify) continue;
 
-      lines.push(`**${member.user.username}** — ${spotify.details} • ${spotify.state}`);
+      listeners.push(
+        `🎵 **${spotify.details}** — *${spotify.state}*\n👤 ${member.user.username}`
+      );
+
       covers.push(spotify.assets?.largeImageURL?.());
     }
 
     const embed = new EmbedBuilder()
-      .setTitle("🎵 Now Playing")
-      .setDescription(lines.length ? lines.join("\n") : "No one is listening to Spotify right now.")
-      .setColor("#1DB954")
-      .setFooter({ text: "Updates automatically • Enable Spotify activity status" });
+      .setColor("#1DB954") // Spotify green
+      .setTitle("🎧 Now Playing in Chaos Club")
+      .setDescription(
+        listeners.length
+          ? `🎶 **${listeners.length} people listening right now**\n\n` + listeners.join("\n\n")
+          : "Nobody is vibing to Spotify right now 😔"
+      )
+      .setFooter({
+        text: "Updates automatically • Turn on Spotify activity",
+        iconURL: "https://cdn-icons-png.flaticon.com/512/174/174872.png"
+      })
+      .setTimestamp();
 
+    // 🔁 Rotating album art
     if (covers.length) {
       embed.setThumbnail(covers[coverIndex % covers.length]);
       coverIndex++;
@@ -94,7 +106,7 @@ async function refreshNowPlaying() {
       if (msg) await msg.edit({ embeds: [embed] });
     }
 
-    console.log("Refreshed now playing...");
+    console.log("Refreshed now playing (pretty mode)");
   } catch (err) {
     console.error("Refresh error:", err.message);
   }
