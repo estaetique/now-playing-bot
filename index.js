@@ -56,7 +56,7 @@ async function updateNowPlaying() {
   }
 
   const embed = new EmbedBuilder()
-    .setTitle("🎧 Now Playing in Chaos Club")
+    .setTitle("🎧 Now Playing in Editing World")
     .setColor("#8a0606");
 
   spotifyUsers.forEach(member => {
@@ -78,3 +78,4 @@ async function updateNowPlaying() {
 }
 
 client.login(process.env.TOKEN);
+
