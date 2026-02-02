@@ -5,6 +5,12 @@
  * - Rotates album art cover each refresh
  * - Opens a web port for Render health checks
  * - Adds clickable Spotify links + progress bars
+ *
+ * IMPORTANT UPDATES ADDED:
+ * ✅ Rate-limit safe refresh (prevents overlap)
+ * ✅ Slower hard refresh interval (30s instead of 15s)
+ * ✅ presenceUpdate debounce refresh (feels live without hammering gateway)
+ * ✅ Slash commands deferReply so they never time out ("application did not respond")
  */
 
 const express = require("express");
@@ -79,7 +85,7 @@ async function registerCommands() {
 }
 
 // =====================
-// PROGRESS BAR + LINK HELPERS (NEW)
+// PROGRESS BAR + LINK HELPERS
 // =====================
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
@@ -198,6 +204,7 @@ async function buildDashboardEmbed() {
   const guild = await client.guilds.fetch(GUILD_ID);
 
   // Ensure we have members + presences cached
+  // NOTE: This is the heavy call, so we protect it with rate-limit-safe scheduling
   await guild.members.fetch({ withPresences: true });
 
   const members = guild.members.cache;
@@ -229,7 +236,7 @@ async function buildDashboardEmbed() {
   }
 
   const embed = new EmbedBuilder()
-    .setColor(0x8a0606) // your wine red
+    .setColor(0x8a0606) // wine red
     .setTitle(`Now Playing in ${guild.name}`)
     .setDescription(
       listeners.length
@@ -279,28 +286,52 @@ async function buildDashboardEmbed() {
 }
 
 // =====================
-// REFRESH LOOP
+// REFRESH LOOP (UPDATED: RATE LIMIT SAFE)
 // =====================
 let intervalHandle = null;
 
+// Rate-limit safety
+let refreshInFlight = false;
+let pendingRefresh = false;
+let presenceDebounce = null;
+
+// Safer hard refresh interval (Discord gateway friendly)
+const HARD_REFRESH_INTERVAL_MS = 30000; // was 15000
+
 async function refreshDashboard() {
+  // Prevent overlapping refreshes
+  if (refreshInFlight) {
+    pendingRefresh = true;
+    return;
+  }
+
+  refreshInFlight = true;
+
   try {
     const embed = await buildDashboardEmbed();
     await upsertNowPlayingMessage(embed);
     console.log("🔁 Dashboard refreshed.");
   } catch (err) {
-    console.error("❌ Refresh failed:", err);
+    console.error("❌ Refresh failed:", err?.message || err);
+  } finally {
+    refreshInFlight = false;
+
+    // If something requested another refresh while we were busy, do one more pass
+    if (pendingRefresh) {
+      pendingRefresh = false;
+      setTimeout(() => refreshDashboard(), 2000);
+    }
   }
 }
 
 function startLoop() {
-  // refresh immediately, then every 15s
   refreshDashboard();
+
   if (intervalHandle) clearInterval(intervalHandle);
 
   intervalHandle = setInterval(() => {
     refreshDashboard();
-  }, 15000);
+  }, HARD_REFRESH_INTERVAL_MS);
 }
 
 // =====================
@@ -312,29 +343,37 @@ client.once("ready", async () => {
   startLoop();
 });
 
+// Debounced refresh on presence changes (feels live without hammering gateway)
+client.on("presenceUpdate", () => {
+  clearTimeout(presenceDebounce);
+  presenceDebounce = setTimeout(() => {
+    refreshDashboard();
+  }, 5000);
+});
+
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   try {
-    if (interaction.commandName === "np") {
-      await refreshDashboard();
-      await interaction.reply({
-        content: "✅ Now Playing dashboard refreshed.",
-        ephemeral: true,
-      });
-    }
+    if (interaction.commandName === "np" || interaction.commandName === "refresh") {
+      // Prevent "application did not respond"
+      await interaction.deferReply({ ephemeral: true });
 
-    if (interaction.commandName === "refresh") {
       await refreshDashboard();
-      await interaction.reply({
-        content: "🔁 Forced refresh done.",
-        ephemeral: true,
-      });
+
+      await interaction.editReply(
+        interaction.commandName === "np"
+          ? "✅ Now Playing dashboard refreshed."
+          : "🔁 Forced refresh done."
+      );
     }
   } catch (err) {
     console.error("❌ Interaction error:", err);
     try {
-      if (!interaction.replied) {
+      // If deferReply happened, editReply; otherwise reply
+      if (interaction.deferred) {
+        await interaction.editReply("❌ Something broke while running that command.");
+      } else if (!interaction.replied) {
         await interaction.reply({
           content: "❌ Something broke while running that command.",
           ephemeral: true,
